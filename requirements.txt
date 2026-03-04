@@ -1,0 +1,19 @@
+# Boston Dynamics Spot SDK
+# Required for connecting to and controlling Spot robots
+
+# Core SDK packages (install from prebuilt wheels in spot-sdk/prebuilt/)
+# Or install from PyPI if using version 5.1.0+ without local wheels
+bosdyn-client>=5.1.0
+bosdyn-core>=5.1.0
+bosdyn-api>=5.1.0
+
+# Optional but recommended packages for additional features
+bosdyn-choreography-client>=5.1.0  # For choreography routines
+bosdyn-mission>=5.1.0              # For mission/autowalk functionality
+
+# Additional dependencies
+numpy>=1.19.0
+
+# Development/testing (optional)
+pytest>=6.0.0
+black>=21.0.0
