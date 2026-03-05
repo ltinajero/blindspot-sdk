@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Press once -> start square walk
-Press again (while running) -> STOP + SIT
-After sitting (either completed or interrupted) -> reset and wait for next start
+Two-button control over serial:
+- start button sends 1 -> start square walk
+- stop button sends 0 -> STOP + SIT
+If stop is not pressed, robot completes square normally.
 """
 
 import argparse
@@ -23,6 +24,10 @@ from bosdyn.client.robot_command import (
 
 from bosdyn.client.robot_command import blocking_sit
 from bosdyn.api import basic_command_pb2
+
+
+class StopRequested(Exception):
+    """Raised when stop button is pressed during square walk."""
 
 def request_stop_and_sit(cmd_client: RobotCommandClient):
     """Send stop command, then sit."""
@@ -49,7 +54,7 @@ def move_with_interrupt(cmd_client, robot, x, y, yaw, seconds, stop_event: threa
     while time.time() < deadline:
         if stop_event.is_set():
             request_stop_and_sit(cmd_client)
-            raise KeyboardInterrupt("Stop requested")
+            raise StopRequested("Stop button requested")
 
         fb = cmd_client.robot_command_feedback(cmd_id)
         mob = fb.feedback.synchronized_feedback.mobility_command_feedback
@@ -71,17 +76,17 @@ def move_with_interrupt(cmd_client, robot, x, y, yaw, seconds, stop_event: threa
 
 class ButtonToggle:
     """
-    Serial button reader that produces 'press events' (edge-triggered).
-    We maintain a press counter per run-cycle and reset it after Spot sits.
+    Serial button reader that maps explicit event codes to START/STOP.
     """
-    def __init__(self, port: str, baud: int, threshold: int, debounce_sec: float):
+    def __init__(self, port: str, baud: int, start_code: int, stop_code: int, debounce_sec: float):
         self.port = port
         self.baud = baud
-        self.threshold = threshold
+        self.start_code = start_code
+        self.stop_code = stop_code
         self.debounce_sec = debounce_sec
 
-        self._presses = 0
-        self._armed = True  # when True, we count presses
+        self._running = False
+        self._last_event_time = 0.0
         self._lock = threading.Lock()
 
         self.start_event = threading.Event()
@@ -90,36 +95,37 @@ class ButtonToggle:
     def reset_cycle(self):
         """Call after Spot sits to allow a fresh start/stop cycle."""
         with self._lock:
-            self._presses = 0
-            self._armed = True
+            self._running = False
             self.start_event.clear()
             self.stop_event.clear()
         print(">>> Reset: waiting for START press.")
 
-    def _handle_press(self):
-        """Internal: handle a button press event."""
+    def _handle_code(self, value: int):
+        """Internal: handle one decoded serial event code."""
+        now = time.time()
         with self._lock:
-            if not self._armed:
+            if now - self._last_event_time < self.debounce_sec:
                 return
-            self._presses += 1
-            if self._presses == 1:
-                print(">>> Button press #1: START")
+
+            self._last_event_time = now
+
+            if value == self.start_code and not self._running:
+                print(f">>> START code received ({self.start_code})")
+                self.stop_event.clear()
                 self.start_event.set()
-            elif self._presses == 2:
-                print(">>> Button press #2: STOP")
+                self._running = True
+            elif value == self.stop_code and self._running:
+                print(f">>> STOP code received ({self.stop_code})")
                 self.stop_event.set()
-            else:
-                # ignore extra presses within same cycle
-                pass
 
     def run_forever(self):
         """Run in a separate thread to monitor the button."""
         ser = serial.Serial(self.port, self.baud, timeout=1)
         ser.reset_input_buffer()
-        print(f">>> Listening on {self.port} @ {self.baud}. threshold={self.threshold}")
-
-        last_pressed_state = False
-        last_press_time = 0.0
+        print(
+            f">>> Listening on {self.port} @ {self.baud}. "
+            f"start_code={self.start_code}, stop_code={self.stop_code}"
+        )
 
         while True:
             if ser.in_waiting <= 0:
@@ -135,16 +141,7 @@ class ButtonToggle:
             except ValueError:
                 continue
 
-            pressed_now = (value >= self.threshold)
-
-            # Rising edge: not pressed -> pressed
-            if pressed_now and not last_pressed_state:
-                now = time.time()
-                if now - last_press_time >= self.debounce_sec:
-                    last_press_time = now
-                    self._handle_press()
-
-            last_pressed_state = pressed_now
+            self._handle_code(value)
 
 def run_square_once(robot, cmd_client, side, lin_speed, yaw_rate, pause, stop_event):
     """Run one square walk cycle. Can be called again after sitting to allow restart."""
@@ -168,10 +165,11 @@ def main():
     p.add_argument("--yaw_rate", type=float, default=0.6, help="Turn rate guess (rad/s)")
     p.add_argument("--pause", type=float, default=0.4, help="Pause between moves (sec)")
 
-    # added serial/button args
+    # serial/button args
     p.add_argument("--serial_port", default="/dev/ttyACM0")
     p.add_argument("--serial_baud", type=int, default=9600)
-    p.add_argument("--button_threshold", type=int, default=1)
+    p.add_argument("--start_code", type=int, default=1, help="Serial value for START button")
+    p.add_argument("--stop_code", type=int, default=0, help="Serial value for STOP button")
     p.add_argument("--debounce", type=float, default=0.4)
 
     args = p.parse_args()
@@ -182,7 +180,8 @@ def main():
     button = ButtonToggle(
         port=args.serial_port,
         baud=args.serial_baud,
-        threshold=args.button_threshold,
+        start_code=args.start_code,
+        stop_code=args.stop_code,
         debounce_sec=args.debounce,
     )
     threading.Thread(target=button.run_forever, daemon=True).start()
@@ -230,9 +229,13 @@ def main():
                     stop_event=button.stop_event,
                 )
                 print(">>> Square finished normally.")
-            except KeyboardInterrupt:
+            except StopRequested:
                 print(">>> Interrupted by STOP press.")
                 # stop+sIt already handled in move_with_interrupt
+            except KeyboardInterrupt:
+                print(">>> Keyboard interrupt received. Stopping and sitting.")
+                request_stop_and_sit(cmd_client)
+                break
             except Exception as e:
                 print(f">>> Error: {e}\n>>> Stopping and sitting for safety.")
                 request_stop_and_sit(cmd_client)
