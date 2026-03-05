@@ -18,10 +18,11 @@ from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.robot_command import (
     RobotCommandClient,
     RobotCommandBuilder,
-   # block_for_trajectory_cmd, - dont use this since we want to interrupt the trajectory command if the button is pressed
+# block_for_trajectory_cmd, - dont use this since we want to interrupt the trajectory command if the button is pressed
 )
 
 from bosdyn.client.robot_command import blocking_sit
+from bosdyn.api import basic_command_pb2
 
 def request_stop_and_sit(cmd_client: RobotCommandClient):
     """Send stop command, then sit."""
@@ -55,7 +56,11 @@ def move_with_interrupt(cmd_client, robot, x, y, yaw, seconds, stop_event: threa
         traj_fb = mob.se2_trajectory_feedback
 
         # Common completion condition in many SDK versions:
-        if traj_fb.status == traj_fb.STATUS_AT_GOAL:
+        done = {basic_command_pb2.SE2TrajectoryCommand.Feedback.STATUS_STOPPED}
+        if hasattr(basic_command_pb2.SE2TrajectoryCommand.Feedback, "STATUS_AT_GOAL"):
+            done.add(basic_command_pb2.SE2TrajectoryCommand.Feedback.STATUS_AT_GOAL)
+
+        if traj_fb.status in done:
             return
 
         time.sleep(0.05)
